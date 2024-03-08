@@ -641,6 +641,27 @@ void WiFiManager::setupHTTPServer(){
   /* Setup httpd callbacks, web pages: root, wifi config pages, SO captive portal detectors and not found. */
 
   // G macro workaround for Uri() bug https://github.com/esp8266/Arduino/issues/7102
+  #if WM_USE_ASYNC_WEBSERVER == 1
+  {
+    using namespace std::placeholders;
+    server->on(WM_G(R_root),       HTTP_ANY, std::bind(&WiFiManager::handleRoot, this, _1));
+    server->on(WM_G(R_wifi),       HTTP_ANY, std::bind(&WiFiManager::handleWifi, this, _1, true));
+    server->on(WM_G(R_wifinoscan), HTTP_ANY, std::bind(&WiFiManager::handleWifi, this, _1, false));
+    server->on(WM_G(R_wifisave),   HTTP_ANY, std::bind(&WiFiManager::handleWifiSave, this, _1));
+    server->on(WM_G(R_info),       HTTP_ANY, std::bind(&WiFiManager::handleInfo, this, _1));
+    server->on(WM_G(R_param),      HTTP_ANY, std::bind(&WiFiManager::handleParam, this, _1));
+    server->on(WM_G(R_paramsave),  HTTP_ANY, std::bind(&WiFiManager::handleParamSave, this, _1));
+    server->on(WM_G(R_restart),    HTTP_ANY, std::bind(&WiFiManager::handleReset, this, _1));
+    server->on(WM_G(R_exit),       HTTP_ANY, std::bind(&WiFiManager::handleExit, this, _1));
+    server->on(WM_G(R_close),      HTTP_ANY, std::bind(&WiFiManager::handleClose, this, _1));
+    server->on(WM_G(R_erase),      HTTP_ANY, std::bind(&WiFiManager::handleErase, this, _1, false));
+    server->on(WM_G(R_status),     HTTP_ANY, std::bind(&WiFiManager::handleWiFiStatus, this, _1));
+    server->onNotFound (std::bind(&WiFiManager::handleNotFound, this, _1));
+    
+    server->on(WM_G(R_update), HTTP_ANY, std::bind(&WiFiManager::handleUpdate, this, _1));
+    server->on(WM_G(R_updatedone), HTTP_POST, std::bind(&WiFiManager::handleUpdateDone, this, _1), std::bind(&WiFiManager::handleUpdating, this, _1,_2,_3,_4,_5,_6));
+  }
+  #else
   server->on(WM_G(R_root),       std::bind(&WiFiManager::handleRoot, this));
   server->on(WM_G(R_wifi),       std::bind(&WiFiManager::handleWifi, this, true));
   server->on(WM_G(R_wifinoscan), std::bind(&WiFiManager::handleWifi, this, false));
@@ -657,6 +678,7 @@ void WiFiManager::setupHTTPServer(){
   
   server->on(WM_G(R_update), std::bind(&WiFiManager::handleUpdate, this));
   server->on(WM_G(R_updatedone), HTTP_POST, std::bind(&WiFiManager::handleUpdateDone, this), std::bind(&WiFiManager::handleUpdating, this));
+  #endif
   
   server->begin(); // Web server start
   #ifdef WM_DEBUG_LEVEL
@@ -869,7 +891,9 @@ uint8_t WiFiManager::processConfigPortal(){
     }
 
     //HTTP handler
+    #if WM_USE_ASYNC_WEBSERVER == 0
     server->handleClient();
+    #endif
 
     // Waiting for save...
     if(connect) {
@@ -967,11 +991,17 @@ bool WiFiManager::shutdownConfigPortal(){
   }
 
   //HTTP handler
+  #if WM_USE_ASYNC_WEBSERVER == 0
   server->handleClient();
+  #endif
 
   // @todo what is the proper way to shutdown and free the server up
   // debug - many open issues aobut port not clearing for use with other servers
+  #if WM_USE_ASYNC_WEBSERVER == 1
+  server->end();
+  #else
   server->stop();
+  #endif
   server.reset();
 
   WiFi.scanDelete(); // free wifi scan results
@@ -1291,15 +1321,32 @@ String WiFiManager::getHTTPHead(String title){
 
   return page;
 }
-
+#if WM_USE_ASYNC_WEBSERVER == 1
+void WiFiManager::HTTPSend(AsyncWebServerRequest *request, const String &content, std::vector<std::pair<String, String>> headers){
+  AsyncWebServerResponse *response = request->beginResponse(200, FPSTR(HTTP_HEAD_CT), content);
+  response->addHeader(FPSTR(HTTP_HEAD_CL), String(content.length()));
+  if (headers.size() > 0)
+  {
+    for (int i = 0; i < headers.size(); i++)
+    {
+      response->addHeader(headers[i].first, headers[i].second);
+    }
+  }
+  request->send(response);
+#else
 void WiFiManager::HTTPSend(const String &content){
   server->send(200, FPSTR(HTTP_HEAD_CT), content);
+#endif
 }
 
 /** 
  * HTTPD handler for page requests
  */
+#if WM_USE_ASYNC_WEBSERVER == 1
+void WiFiManager::handleRequest(AsyncWebServerRequest *request) {
+#else
 void WiFiManager::handleRequest() {
+#endif
   _webPortalAccessed = millis();
 
   // TESTING HTTPD AUTH RFC 2617
@@ -1310,14 +1357,21 @@ void WiFiManager::handleRequest() {
   // void requestAuthentication(HTTPAuthMethod mode = BASIC_AUTH, const char* realm = NULL, const String& authFailMsg = String("") );
 
   // 2.3 NO AUTH available
-  bool testauth = false;
-  if(!testauth) return;
+  if(!_testAuth) return;
   
   DEBUG_WM(WM_DEBUG_DEV,F("DOING AUTH"));
-  bool res = server->authenticate("admin","12345");
+  #if WM_USE_ASYNC_WEBSERVER == 1
+  bool res = request->authenticate(_username.c_str(), _password.c_str());
+  #else
+  bool res = server->authenticate(_username.c_str(), _password.c_str());
+  #endif
   if(!res){
     #ifndef WM_NOAUTH
+    #if WM_USE_ASYNC_WEBSERVER == 1
+    request->requestAuthentication(); // DIGEST_AUTH
+    #else
     server->requestAuthentication(HTTPAuthMethod::BASIC_AUTH); // DIGEST_AUTH
+    #endif
     #endif
     DEBUG_WM(WM_DEBUG_DEV,F("AUTH FAIL"));
   }
@@ -1326,12 +1380,21 @@ void WiFiManager::handleRequest() {
 /** 
  * HTTPD CALLBACK root or redirect to captive portal
  */
+#if WM_USE_ASYNC_WEBSERVER == 1
+void WiFiManager::handleRoot(AsyncWebServerRequest *request) {
+#else
 void WiFiManager::handleRoot() {
+#endif
   #ifdef WM_DEBUG_LEVEL
   DEBUG_WM(WM_DEBUG_VERBOSE,F("<- HTTP Root"));
   #endif
+  #if WM_USE_ASYNC_WEBSERVER == 1
+  if (captivePortal(request)) return; // If captive portal redirect instead of displaying the page
+  handleRequest(request);
+  #else
   if (captivePortal()) return; // If captive portal redirect instead of displaying the page
   handleRequest();
+  #endif
   String page = getHTTPHead(_title); // @token options @todo replace options with title
   String str  = FPSTR(HTTP_ROOT_MAIN); // @todo custom title
   str.replace(FPSTR(T_t),_title);
@@ -1342,7 +1405,11 @@ void WiFiManager::handleRoot() {
   reportStatus(page);
   page += FPSTR(HTTP_END);
 
+  #if WM_USE_ASYNC_WEBSERVER == 1
+  HTTPSend(request, page);
+  #else
   HTTPSend(page);
+  #endif
   if(_preloadwifiscan) WiFi_scanNetworks(_scancachetime,true); // preload wifiscan throttled, async
   // @todo buggy, captive portals make a query on every page load, causing this to run every time in addition to the real page load
   // I dont understand why, when you are already in the captive portal, I guess they want to know that its still up and not done or gone
@@ -1352,17 +1419,29 @@ void WiFiManager::handleRoot() {
 /**
  * HTTPD CALLBACK Wifi config page handler
  */
+#if WM_USE_ASYNC_WEBSERVER == 1
+void WiFiManager::handleWifi(AsyncWebServerRequest *request, boolean scan) {
+#else
 void WiFiManager::handleWifi(boolean scan) {
+#endif
   #ifdef WM_DEBUG_LEVEL
   DEBUG_WM(WM_DEBUG_VERBOSE,F("<- HTTP Wifi"));
   #endif
+  #if WM_USE_ASYNC_WEBSERVER == 1
+  handleRequest(request);
+  #else
   handleRequest();
+  #endif
   String page = getHTTPHead(FPSTR(S_titlewifi)); // @token titlewifi
   if (scan) {
     #ifdef WM_DEBUG_LEVEL
-    // DEBUG_WM(WM_DEBUG_DEV,"refresh flag:",server->hasArg(F("refresh")));
+    // DEBUG_WM(WM_DEBUG_DEV,"refresh flag:",request->hasArg(F("refresh")));
     #endif
+    #if WM_USE_ASYNC_WEBSERVER == 1
+    WiFi_scanNetworks(request->hasArg(F("refresh")),false); //wifiscan, force if arg refresh
+    #else
     WiFi_scanNetworks(server->hasArg(F("refresh")),false); //wifiscan, force if arg refresh
+    #endif
     page += getScanItemOut();
   }
   String pitem = "";
@@ -1398,7 +1477,11 @@ void WiFiManager::handleWifi(boolean scan) {
   reportStatus(page);
   page += FPSTR(HTTP_END);
 
+  #if WM_USE_ASYNC_WEBSERVER == 1
+  HTTPSend(request, page);
+  #else
   HTTPSend(page);
+  #endif
 
   #ifdef WM_DEBUG_LEVEL
   DEBUG_WM(WM_DEBUG_DEV,F("Sent config page"));
@@ -1408,11 +1491,19 @@ void WiFiManager::handleWifi(boolean scan) {
 /**
  * HTTPD CALLBACK Wifi param page handler
  */
+#if WM_USE_ASYNC_WEBSERVER == 1
+void WiFiManager::handleParam(AsyncWebServerRequest *request){
+#else
 void WiFiManager::handleParam(){
+#endif
   #ifdef WM_DEBUG_LEVEL
   DEBUG_WM(WM_DEBUG_VERBOSE,F("<- HTTP Param"));
   #endif
+  #if WM_USE_ASYNC_WEBSERVER == 1
+  handleRequest(request);
+  #else
   handleRequest();
+  #endif
   String page = getHTTPHead(FPSTR(S_titleparam)); // @token titlewifi
 
   String pitem = "";
@@ -1427,7 +1518,11 @@ void WiFiManager::handleParam(){
   reportStatus(page);
   page += FPSTR(HTTP_END);
 
+  #if WM_USE_ASYNC_WEBSERVER == 1
+  HTTPSend(request, page);
+  #else
   HTTPSend(page);
+  #endif
 
   #ifdef WM_DEBUG_LEVEL
   DEBUG_WM(WM_DEBUG_DEV,F("Sent param page"));
@@ -1788,32 +1883,61 @@ String WiFiManager::getParamOut(){
   return page;
 }
 
+#if WM_USE_ASYNC_WEBSERVER == 1
+void WiFiManager::handleWiFiStatus(AsyncWebServerRequest *request){
+#else
 void WiFiManager::handleWiFiStatus(){
+#endif
   #ifdef WM_DEBUG_LEVEL
   DEBUG_WM(WM_DEBUG_VERBOSE,F("<- HTTP WiFi status "));
   #endif
+  #if WM_USE_ASYNC_WEBSERVER == 1
+  handleRequest(request);
+  #else
   handleRequest();
+  #endif
   String page;
   // String page = "{\"result\":true,\"count\":1}";
   #ifdef WM_JSTEST
     page = FPSTR(HTTP_JS);
   #endif
+  #if WM_USE_ASYNC_WEBSERVER == 1
+  HTTPSend(request, page);
+  #else
   HTTPSend(page);
+  #endif
 }
 
 /** 
  * HTTPD CALLBACK save form and redirect to WLAN config page again
  */
+#if WM_USE_ASYNC_WEBSERVER == 1
+void WiFiManager::handleWifiSave(AsyncWebServerRequest *request) {
+#else
 void WiFiManager::handleWifiSave() {
+#endif
   #ifdef WM_DEBUG_LEVEL
   DEBUG_WM(WM_DEBUG_VERBOSE,F("<- HTTP WiFi save "));
+  #if WM_USE_ASYNC_WEBSERVER == 1
+  DEBUG_WM(WM_DEBUG_DEV,F("Method:"),request->method() == HTTP_GET  ? (String)FPSTR(S_GET) : (String)FPSTR(S_POST));
+  #else
   DEBUG_WM(WM_DEBUG_DEV,F("Method:"),server->method() == HTTP_GET  ? (String)FPSTR(S_GET) : (String)FPSTR(S_POST));
   #endif
+  #endif
+  #if WM_USE_ASYNC_WEBSERVER == 1
+  handleRequest(request);
+  #else
   handleRequest();
+  #endif
 
   //SAVE/connect here
+  #if WM_USE_ASYNC_WEBSERVER == 1
+  _ssid = request->arg(F("s")).c_str();
+  _pass = request->arg(F("p")).c_str();
+  #else
   _ssid = server->arg(F("s")).c_str();
   _pass = server->arg(F("p")).c_str();
+  #endif
 
   if(_ssid == "" && _pass != ""){
     _ssid = WiFi_SSID(true); // password change, placeholder ssid, @todo compare pass to old?, confirm ssid is clean
@@ -1825,44 +1949,81 @@ void WiFiManager::handleWifiSave() {
   #ifdef WM_DEBUG_LEVEL
   String requestinfo = "SERVER_REQUEST\n----------------\n";
   requestinfo += "URI: ";
+  #if WM_USE_ASYNC_WEBSERVER == 1
+  requestinfo += request->url();
+  #else
   requestinfo += server->uri();
+  #endif
   requestinfo += "\nMethod: ";
+  #if WM_USE_ASYNC_WEBSERVER == 1
+  requestinfo += (request->method() == HTTP_GET) ? "GET" : "POST";
+  #else
   requestinfo += (server->method() == HTTP_GET) ? "GET" : "POST";
+  #endif
   requestinfo += "\nArguments: ";
+  #if WM_USE_ASYNC_WEBSERVER == 1
+  requestinfo += request->args();
+  requestinfo += "\n";
+  for (uint8_t i = 0; i < request->args(); i++) {
+    requestinfo += " " + request->argName(i) + ": " + request->arg(i) + "\n";
+  }
+  #else
   requestinfo += server->args();
   requestinfo += "\n";
   for (uint8_t i = 0; i < server->args(); i++) {
     requestinfo += " " + server->argName(i) + ": " + server->arg(i) + "\n";
   }
+  #endif
 
   DEBUG_WM(WM_DEBUG_MAX,requestinfo);
   #endif
 
   // set static ips from server args
+  #if WM_USE_ASYNC_WEBSERVER == 1
+  if (request->arg(FPSTR(S_ip)) != "") {
+    //_sta_static_ip.fromString(request->arg(FPSTR(S_ip));
+    String ip = request->arg(FPSTR(S_ip));
+  #else
   if (server->arg(FPSTR(S_ip)) != "") {
     //_sta_static_ip.fromString(server->arg(FPSTR(S_ip));
     String ip = server->arg(FPSTR(S_ip));
+  #endif
     optionalIPFromString(&_sta_static_ip, ip.c_str());
     #ifdef WM_DEBUG_LEVEL
     DEBUG_WM(WM_DEBUG_DEV,F("static ip:"),ip);
     #endif
   }
+  #if WM_USE_ASYNC_WEBSERVER == 1
+  if (request->arg(FPSTR(S_gw)) != "") {
+    String gw = request->arg(FPSTR(S_gw));
+  #else
   if (server->arg(FPSTR(S_gw)) != "") {
     String gw = server->arg(FPSTR(S_gw));
+  #endif
     optionalIPFromString(&_sta_static_gw, gw.c_str());
     #ifdef WM_DEBUG_LEVEL
     DEBUG_WM(WM_DEBUG_DEV,F("static gateway:"),gw);
     #endif
   }
+  #if WM_USE_ASYNC_WEBSERVER == 1
+  if (request->arg(FPSTR(S_sn)) != "") {
+    String sn = request->arg(FPSTR(S_sn));
+  #else
   if (server->arg(FPSTR(S_sn)) != "") {
     String sn = server->arg(FPSTR(S_sn));
+  #endif
     optionalIPFromString(&_sta_static_sn, sn.c_str());
     #ifdef WM_DEBUG_LEVEL
     DEBUG_WM(WM_DEBUG_DEV,F("static netmask:"),sn);
     #endif
   }
+  #if WM_USE_ASYNC_WEBSERVER == 1
+  if (request->arg(FPSTR(S_dns)) != "") {
+    String dns = request->arg(FPSTR(S_dns));
+  #else
   if (server->arg(FPSTR(S_dns)) != "") {
     String dns = server->arg(FPSTR(S_dns));
+  #endif
     optionalIPFromString(&_sta_static_dns, dns.c_str());
     #ifdef WM_DEBUG_LEVEL
     DEBUG_WM(WM_DEBUG_DEV,F("static DNS:"),dns);
@@ -1873,7 +2034,11 @@ void WiFiManager::handleWifiSave() {
     _presavewificallback();  // @CALLBACK 
   }
 
+  #if WM_USE_ASYNC_WEBSERVER == 1
+  if(_paramsInWifi) doParamSave(request);
+  #else
   if(_paramsInWifi) doParamSave();
+  #endif
 
   String page;
 
@@ -1889,8 +2054,12 @@ void WiFiManager::handleWifiSave() {
   if(_showBack) page += FPSTR(HTTP_BACKBTN);
   page += FPSTR(HTTP_END);
 
+  #if WM_USE_ASYNC_WEBSERVER == 1
+  HTTPSend(request, page, {{FPSTR(HTTP_HEAD_CORS), FPSTR(HTTP_HEAD_CORS_ALLOW_ALL)}});
+  #else
   server->sendHeader(FPSTR(HTTP_HEAD_CORS), FPSTR(HTTP_HEAD_CORS_ALLOW_ALL)); // @HTTPHEAD send cors
   HTTPSend(page);
+  #endif
 
   #ifdef WM_DEBUG_LEVEL
   DEBUG_WM(WM_DEBUG_DEV,F("Sent wifi save page"));
@@ -1899,31 +2068,53 @@ void WiFiManager::handleWifiSave() {
   connect = true; //signal ready to connect/reset process in processConfigPortal
 }
 
+#if WM_USE_ASYNC_WEBSERVER == 1
+void WiFiManager::handleParamSave(AsyncWebServerRequest *request) {
+#else
 void WiFiManager::handleParamSave() {
+#endif
 
   #ifdef WM_DEBUG_LEVEL
   DEBUG_WM(WM_DEBUG_VERBOSE,F("<- HTTP Param save "));
   #endif
   #ifdef WM_DEBUG_LEVEL
+  #if WM_USE_ASYNC_WEBSERVER == 1
+  DEBUG_WM(WM_DEBUG_DEV,F("Method:"),request->method() == HTTP_GET  ? (String)FPSTR(S_GET) : (String)FPSTR(S_POST));
+  #else
   DEBUG_WM(WM_DEBUG_DEV,F("Method:"),server->method() == HTTP_GET  ? (String)FPSTR(S_GET) : (String)FPSTR(S_POST));
   #endif
+  #endif
+  #if WM_USE_ASYNC_WEBSERVER == 1
+  handleRequest(request);
+
+  doParamSave(request);
+  #else
   handleRequest();
 
   doParamSave();
+  #endif
 
   String page = getHTTPHead(FPSTR(S_titleparamsaved)); // @token titleparamsaved
   page += FPSTR(HTTP_PARAMSAVED);
   if(_showBack) page += FPSTR(HTTP_BACKBTN); 
   page += FPSTR(HTTP_END);
 
+  #if WM_USE_ASYNC_WEBSERVER == 1
+  HTTPSend(request, page);
+  #else
   HTTPSend(page);
+  #endif
 
   #ifdef WM_DEBUG_LEVEL
   DEBUG_WM(WM_DEBUG_DEV,F("Sent param save page"));
   #endif
 }
 
+#if WM_USE_ASYNC_WEBSERVER == 1
+void WiFiManager::doParamSave(AsyncWebServerRequest *request){
+#else
 void WiFiManager::doParamSave(){
+#endif
    // @todo use new callback for before paramsaves, is this really needed?
   if ( _presaveparamscallback != NULL) {
     _presaveparamscallback();  // @CALLBACK
@@ -1946,11 +2137,19 @@ void WiFiManager::doParamSave(){
       //read parameter from server
       String name = (String)FPSTR(S_parampre)+(String)i;
       String value;
+      #if WM_USE_ASYNC_WEBSERVER == 1
+      if(request->hasArg(name.c_str())) {
+        value = request->arg(name);
+      } else {
+        value = request->arg(_params[i]->getID());
+      }
+      #else
       if(server->hasArg(name)) {
         value = server->arg(name);
       } else {
         value = server->arg(_params[i]->getID());
       }
+      #endif
 
       //store it in params array
       value.toCharArray(_params[i]->_value, _params[i]->_length+1); // length+1 null terminated
@@ -1972,11 +2171,19 @@ void WiFiManager::doParamSave(){
 /** 
  * HTTPD CALLBACK info page
  */
+#if WM_USE_ASYNC_WEBSERVER == 1
+void WiFiManager::handleInfo(AsyncWebServerRequest *request) {
+#else
 void WiFiManager::handleInfo() {
+#endif
   #ifdef WM_DEBUG_LEVEL
   DEBUG_WM(WM_DEBUG_VERBOSE,F("<- HTTP Info"));
   #endif
+  #if WM_USE_ASYNC_WEBSERVER == 1
+  handleRequest(request);
+  #else
   handleRequest();
+  #endif
   String page = getHTTPHead(FPSTR(S_titleinfo)); // @token titleinfo
   reportStatus(page);
 
@@ -2073,7 +2280,11 @@ void WiFiManager::handleInfo() {
   page += FPSTR(HTTP_HELP);
   page += FPSTR(HTTP_END);
 
+  #if WM_USE_ASYNC_WEBSERVER == 1
+  HTTPSend(request, page);
+  #else
   HTTPSend(page);
+  #endif
 
   #ifdef WM_DEBUG_LEVEL
   DEBUG_WM(WM_DEBUG_DEV,F("Sent info page"));
@@ -2317,16 +2528,28 @@ String WiFiManager::getInfoData(String id){
 /** 
  * HTTPD CALLBACK exit, closes configportal if blocking, if non blocking undefined
  */
+#if WM_USE_ASYNC_WEBSERVER == 1
+void WiFiManager::handleExit(AsyncWebServerRequest *request) {
+#else
 void WiFiManager::handleExit() {
+#endif
   #ifdef WM_DEBUG_LEVEL
   DEBUG_WM(WM_DEBUG_VERBOSE,F("<- HTTP Exit"));
   #endif
+  #if WM_USE_ASYNC_WEBSERVER == 1
+  handleRequest(request);
+  #else
   handleRequest();
+  #endif
   String page = getHTTPHead(FPSTR(S_titleexit)); // @token titleexit
   page += FPSTR(S_exiting); // @token exiting
   // ('Logout', 401, {'WWW-Authenticate': 'Basic realm="Login required"'})
+  #if WM_USE_ASYNC_WEBSERVER == 1
+  HTTPSend(request, page, {{F("Cache-Control"), F("no-cache, no-store, must-revalidate")}});
+  #else
   server->sendHeader(F("Cache-Control"), F("no-cache, no-store, must-revalidate")); // @HTTPHEAD send cache
   HTTPSend(page);
+  #endif
   delay(2000);
   abort = true;
 }
@@ -2334,16 +2557,28 @@ void WiFiManager::handleExit() {
 /** 
  * HTTPD CALLBACK reset page
  */
+#if WM_USE_ASYNC_WEBSERVER == 1
+void WiFiManager::handleReset(AsyncWebServerRequest *request) {
+#else
 void WiFiManager::handleReset() {
+#endif
   #ifdef WM_DEBUG_LEVEL
   DEBUG_WM(WM_DEBUG_VERBOSE,F("<- HTTP Reset"));
   #endif
+  #if WM_USE_ASYNC_WEBSERVER == 1
+  handleRequest(request);
+  #else
   handleRequest();
+  #endif
   String page = getHTTPHead(FPSTR(S_titlereset)); //@token titlereset
   page += FPSTR(S_resetting); //@token resetting
   page += FPSTR(HTTP_END);
 
+  #if WM_USE_ASYNC_WEBSERVER == 1
+  HTTPSend(request, page);
+  #else
   HTTPSend(page);
+  #endif
 
   #ifdef WM_DEBUG_LEVEL
   DEBUG_WM(F("RESETTING ESP"));
@@ -2359,11 +2594,19 @@ void WiFiManager::handleReset() {
 // void WiFiManager::handleErase() {
 //   handleErase(false);
 // }
+#if WM_USE_ASYNC_WEBSERVER == 1
+void WiFiManager::handleErase(AsyncWebServerRequest *request, boolean opt) {
+#else
 void WiFiManager::handleErase(boolean opt) {
+#endif
   #ifdef WM_DEBUG_LEVEL
   DEBUG_WM(WM_DEBUG_NOTIFY,F("<- HTTP Erase"));
   #endif
+  #if WM_USE_ASYNC_WEBSERVER == 1
+  handleRequest(request);
+  #else
   handleRequest();
+  #endif
   String page = getHTTPHead(FPSTR(S_titleerase)); // @token titleerase
 
   bool ret = erase(opt);
@@ -2377,7 +2620,11 @@ void WiFiManager::handleErase(boolean opt) {
   }
 
   page += FPSTR(HTTP_END);
+  #if WM_USE_ASYNC_WEBSERVER == 1
+  HTTPSend(request, page);
+  #else
   HTTPSend(page);
+  #endif
 
   if(ret){
     delay(2000);
@@ -2391,29 +2638,61 @@ void WiFiManager::handleErase(boolean opt) {
 /** 
  * HTTPD CALLBACK 404
  */
+#if WM_USE_ASYNC_WEBSERVER == 1
+void WiFiManager::handleNotFound(AsyncWebServerRequest *request) {
+  if (captivePortal(request)) return; // If captive portal redirect instead of displaying the page
+  handleRequest(request);
+#else
 void WiFiManager::handleNotFound() {
   if (captivePortal()) return; // If captive portal redirect instead of displaying the page
   handleRequest();
+#endif
   String message = FPSTR(S_notfound); // @token notfound
 
   bool verbose404 = false; // show info in 404 body, uri,method, args
   if(verbose404){
     message += FPSTR(S_uri); // @token uri
+    #if WM_USE_ASYNC_WEBSERVER == 1
+    message += request->url();
+    #else
     message += server->uri();
+    #endif
     message += FPSTR(S_method); // @token method
+    #if WM_USE_ASYNC_WEBSERVER == 1
+    message += ( request->method() == HTTP_GET ) ? FPSTR(S_GET) : FPSTR(S_POST);
+    #else
     message += ( server->method() == HTTP_GET ) ? FPSTR(S_GET) : FPSTR(S_POST);
+    #endif
     message += FPSTR(S_args); // @token args
+    #if WM_USE_ASYNC_WEBSERVER == 1
+    message += request->args();
+    #else
     message += server->args();
+    #endif
     message += F("\n");
 
+    #if WM_USE_ASYNC_WEBSERVER == 1
+    for ( uint8_t i = 0; i < request->args(); i++ ) {
+      message += " " + request->argName ( i ) + ": " + request->arg ( i ) + "\n";
+    }
+    #else
     for ( uint8_t i = 0; i < server->args(); i++ ) {
       message += " " + server->argName ( i ) + ": " + server->arg ( i ) + "\n";
     }
+    #endif 
   }
+  #if WM_USE_ASYNC_WEBSERVER == 1
+  AsyncWebServerResponse *response = request->beginResponse(404, FPSTR(HTTP_HEAD_CT2), message);
+  response->addHeader(F("Cache-Control"), F("no-cache, no-store, must-revalidate")); // @HTTPHEAD send cache
+  response->addHeader(F("Pragma"), F("no-cache"));
+  response->addHeader(F("Expires"), F("-1"));
+  request->send (response);
+  #else
   server->sendHeader(F("Cache-Control"), F("no-cache, no-store, must-revalidate")); // @HTTPHEAD send cache
   server->sendHeader(F("Pragma"), F("no-cache"));
   server->sendHeader(F("Expires"), F("-1"));
   server->send ( 404, FPSTR(HTTP_HEAD_CT2), message );
+  #endif
 }
 
 /**
@@ -2421,14 +2700,26 @@ void WiFiManager::handleNotFound() {
  * Redirect to captive portal if we got a request for another domain. 
  * Return true in that case so the page handler do not try to handle the request again. 
  */
+#if WM_USE_ASYNC_WEBSERVER == 1
+boolean WiFiManager::captivePortal(AsyncWebServerRequest *request) {
+#else
 boolean WiFiManager::captivePortal() {
+#endif
   
   if(!_enableCaptivePortal || !configPortalActive) return false; // skip redirections if cp not enabled or not in ap mode
   
+  #if WM_USE_ASYNC_WEBSERVER == 1
+  String serverLoc =  toStringIp(request->client()->localIP());
+  #else
   String serverLoc =  toStringIp(server->client().localIP());
+  #endif
 
   #ifdef WM_DEBUG_LEVEL
+  #if WM_USE_ASYNC_WEBSERVER == 1
+  DEBUG_WM(WM_DEBUG_DEV,"-> " + request->host());
+  #else
   DEBUG_WM(WM_DEBUG_DEV,"-> " + server->hostHeader());
+  #endif
   DEBUG_WM(WM_DEBUG_DEV,"serverLoc " + serverLoc);
   #endif
 
@@ -2441,16 +2732,26 @@ boolean WiFiManager::captivePortal() {
   }
   
   if(_httpPort != 80) serverLoc += ":" + (String)_httpPort; // add port if not default
+  #if WM_USE_ASYNC_WEBSERVER == 1
+  bool doredirect = serverLoc != request->host(); // redirect if hostheader not server ip, prevent redirect loops
+  #else
   bool doredirect = serverLoc != server->hostHeader(); // redirect if hostheader not server ip, prevent redirect loops
+  #endif
   
   if (doredirect) {
     #ifdef WM_DEBUG_LEVEL
     DEBUG_WM(WM_DEBUG_VERBOSE,F("<- Request redirected to captive portal"));
     DEBUG_WM(WM_DEBUG_DEV,"serverLoc " + serverLoc);
     #endif
+    #if WM_USE_ASYNC_WEBSERVER == 1
+    AsyncWebServerResponse *response = request->beginResponse(302, FPSTR(HTTP_HEAD_CT2), ""); // Empty content inhibits Content-length header so we have to close the socket ourselves.
+    response->addHeader(F("Location"), (String)F("http://") + serverLoc); // @HTTPHEAD send redirect
+    request->send(response);
+    #else
     server->sendHeader(F("Location"), (String)F("http://") + serverLoc, true); // @HTTPHEAD send redirect
     server->send ( 302, FPSTR(HTTP_HEAD_CT2), ""); // Empty content inhibits Content-length header so we have to close the socket ourselves.
     server->client().stop(); // Stop is needed because we sent no content length
+    #endif
     return true;
   }
   return false;
@@ -2462,16 +2763,28 @@ void WiFiManager::stopCaptivePortal(){
 }
 
 // HTTPD CALLBACK, handle close,  stop captive portal, if not enabled undefined
+#if WM_USE_ASYNC_WEBSERVER == 1
+void WiFiManager::handleClose(AsyncWebServerRequest *request){
+#else
 void WiFiManager::handleClose(){
+#endif
   DEBUG_WM(WM_DEBUG_VERBOSE,F("Disabling Captive Portal"));
   stopCaptivePortal();
   #ifdef WM_DEBUG_LEVEL
   DEBUG_WM(WM_DEBUG_VERBOSE,F("<- HTTP close"));
   #endif
+  #if WM_USE_ASYNC_WEBSERVER == 1
+  handleRequest(request);
+  #else
   handleRequest();
+  #endif
   String page = getHTTPHead(FPSTR(S_titleclose)); // @token titleclose
   page += FPSTR(S_closing); // @token closing
+  #if WM_USE_ASYNC_WEBSERVER == 1
+  HTTPSend(request, page);
+  #else
   HTTPSend(page);
+  #endif
 }
 
 void WiFiManager::reportStatus(String &page){
@@ -3869,11 +4182,19 @@ void WiFiManager::WiFi_autoReconnect(){
 }
 
 // Called when /update is requested
+#if WM_USE_ASYNC_WEBSERVER == 1
+void WiFiManager::handleUpdate(AsyncWebServerRequest *request) {
+#else
 void WiFiManager::handleUpdate() {
+#endif
   #ifdef WM_DEBUG_LEVEL
 	DEBUG_WM(WM_DEBUG_VERBOSE,F("<- Handle update"));
   #endif
+  #if WM_USE_ASYNC_WEBSERVER == 1
+	if (captivePortal(request)) return; // If captive portal redirect instead of displaying the page
+  #else
 	if (captivePortal()) return; // If captive portal redirect instead of displaying the page
+  #endif
 	String page = getHTTPHead(_title); // @token options
 	String str = FPSTR(HTTP_ROOT_MAIN);
   str.replace(FPSTR(T_t), _title);
@@ -3883,12 +4204,20 @@ void WiFiManager::handleUpdate() {
 	page += FPSTR(HTTP_UPDATE);
 	page += FPSTR(HTTP_END);
 
+  #if WM_USE_ASYNC_WEBSERVER == 1
+	HTTPSend(request, page);
+  #else
 	HTTPSend(page);
+  #endif
 
 }
 
 // upload via /u POST
+#if WM_USE_ASYNC_WEBSERVER == 1
+void WiFiManager::handleUpdating(AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final){
+#else
 void WiFiManager::handleUpdating(){
+#endif
   // @todo
   // cannot upload files in captive portal, file select is not allowed, show message with link or hide
   // cannot upload if softreset after upload, maybe check for hard reset at least for dev, ERROR[11]: Invalid bootstrapping state, reset ESP8266 before updating
@@ -3905,12 +4234,18 @@ void WiFiManager::handleUpdating(){
   unsigned long _configPortalTimeoutSAV = _configPortalTimeout; // store cp timeout
   _configPortalTimeout = 0; // disable timeout
 
+  #if WM_USE_ASYNC_WEBSERVER == 0
   // handler for the file upload, get's the sketch bytes, and writes
 	// them through the Update object
 	HTTPUpload& upload = server->upload();
+  #endif
 
   // UPLOAD START
+  #if WM_USE_ASYNC_WEBSERVER == 1
+	if (!index) {
+  #else
 	if (upload.status == UPLOAD_FILE_START) {
+  #endif
 	  // if(_debug) Serial.setDebugOutput(true);
     uint32_t maxSketchSpace;
     
@@ -3929,7 +4264,11 @@ void WiFiManager::handleUpdating(){
     #endif
 
     #ifdef WM_DEBUG_LEVEL
+    #if WM_USE_ASYNC_WEBSERVER == 1
+    DEBUG_WM(WM_DEBUG_VERBOSE,"[OTA] Update file: ", filename.c_str());
+    #else
     DEBUG_WM(WM_DEBUG_VERBOSE,"[OTA] Update file: ", upload.filename.c_str());
+    #endif
     #endif
 
     // Update.onProgress(THandlerFunction_Progress fn);
@@ -3946,9 +4285,15 @@ void WiFiManager::handleUpdating(){
   	}
 	}
   // UPLOAD WRITE
+  #if WM_USE_ASYNC_WEBSERVER == 1
+  else if (index < len) {
+		// Serial.print(".");
+		if (Update.write(data, len) != len) {
+  #else
   else if (upload.status == UPLOAD_FILE_WRITE) {
 		// Serial.print(".");
 		if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+  #endif
       #ifdef WM_DEBUG_LEVEL
       DEBUG_WM(WM_DEBUG_ERROR,F("[ERROR] OTA Update WRITE ERROR"), Update.getError());
 			//Update.printError(Serial); // write failure
@@ -3957,10 +4302,18 @@ void WiFiManager::handleUpdating(){
 		}
 	}
   // UPLOAD FILE END
+  #if WM_USE_ASYNC_WEBSERVER == 1
+  if (final) {
+  #else
   else if (upload.status == UPLOAD_FILE_END) {
+  #endif
 		if (Update.end(true)) { // true to set the size to the current progress
       #ifdef WM_DEBUG_LEVEL
+      #if WM_USE_ASYNC_WEBSERVER == 1
+      DEBUG_WM(WM_DEBUG_VERBOSE,F("\n\n[OTA] OTA FILE END bytes: "), index + len);
+      #else
       DEBUG_WM(WM_DEBUG_VERBOSE,F("\n\n[OTA] OTA FILE END bytes: "), upload.totalSize);
+      #endif
 			// Serial.printf("Updated: %u bytes\r\nRebooting...\r\n", upload.totalSize);
       #endif
 		}
@@ -3970,7 +4323,11 @@ void WiFiManager::handleUpdating(){
 		}
 	}
   // UPLOAD ABORT
+  #if WM_USE_ASYNC_WEBSERVER == 1
+  if (abort) {
+  #else
   else if (upload.status == UPLOAD_FILE_ABORTED) {
+  #endif
 		Update.end();
 		DEBUG_WM(F("[OTA] Update was aborted"));
     error = true;
@@ -3980,7 +4337,11 @@ void WiFiManager::handleUpdating(){
 }
 
 // upload and ota done, show status
+#if WM_USE_ASYNC_WEBSERVER == 1
+void WiFiManager::handleUpdateDone(AsyncWebServerRequest *request) {
+#else
 void WiFiManager::handleUpdateDone() {
+#endif
 	DEBUG_WM(WM_DEBUG_VERBOSE, F("<- Handle update done"));
 	// if (captivePortal()) return; // If captive portal redirect instead of displaying the page
 
@@ -4005,12 +4366,26 @@ void WiFiManager::handleUpdateDone() {
 	}
 	page += FPSTR(HTTP_END);
 
+  #if WM_USE_ASYNC_WEBSERVER == 1
+  HTTPSend(request, page);
+  #else
 	HTTPSend(page);
+  #endif
 
 	delay(1000); // send page
 	if (!Update.hasError()) {
 		ESP.restart();
 	}
+}
+
+void WiFiManager::setWebPortalAuthentication(String user, String password)
+{
+  if (user != "")
+  {
+    _username = user;
+    _password = password;
+    _testAuth = true;
+  }
 }
 
 #endif

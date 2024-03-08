@@ -61,7 +61,9 @@
 // #define esp32autoreconnect    // implement esp32 autoreconnect event listener kludge, @DEPRECATED
 // autoreconnect is WORKING https://github.com/espressif/arduino-esp32/issues/653#issuecomment-405604766
 
-#define WM_WEBSERVERSHIM      // use webserver shim lib
+#ifndef  WM_USE_ASYNC_WEBSERVER
+  #define  WM_USE_ASYNC_WEBSERVER 0
+#endif
 
 #define WM_G(string_literal)  (String(FPSTR(string_literal)).c_str())
 
@@ -71,7 +73,12 @@
       #include "user_interface.h"
     }
     #include <ESP8266WiFi.h>
-    #include <ESP8266WebServer.h>
+
+    #if WM_USE_ASYNC_WEBSERVER == 1
+        #include <ESPAsyncWebServer.h>
+    #else
+        #include <ESP8266WebServer.h>
+    #endif
 
     #ifdef WM_MDNS
         #include <ESP8266mDNS.h>
@@ -89,14 +96,10 @@
     #define WIFI_getChipId() (uint32_t)ESP.getEfuseMac()
     #define WM_WIFIOPEN   WIFI_AUTH_OPEN
 
-    #ifndef WEBSERVER_H
-        #ifdef WM_WEBSERVERSHIM
-            #include <WebServer.h>
-        #else
-            #include <ESP8266WebServer.h>
-            // Forthcoming official ? probably never happening
-            // https://github.com/esp8266/ESPWebServer
-        #endif
+    #if WM_USE_ASYNC_WEBSERVER == 1
+        #include <ESPAsyncWebServer.h>
+    #else
+        #include <WebServer.h>
     #endif
 
     #ifdef WM_ERASE_NVS
@@ -497,13 +500,19 @@ class WiFiManager
     // get hostname helper
     String        getWiFiHostname();
 
+    void          setWebPortalAuthentication(String username, String password);
+
 
     std::unique_ptr<DNSServer>        dnsServer;
 
-    #if defined(ESP32) && defined(WM_WEBSERVERSHIM)
-        using WM_WebServer = WebServer;
+    #if WM_USE_ASYNC_WEBSERVER == 1
+        using WM_WebServer = AsyncWebServer;
     #else
-        using WM_WebServer = ESP8266WebServer;
+        #if defined(ESP32)
+            using WM_WebServer = WebServer;
+        #else
+            using WM_WebServer = ESP8266WebServer;
+        #endif
     #endif
     
     std::unique_ptr<WM_WebServer> server;
@@ -563,6 +572,10 @@ class WiFiManager
                                                    // on some conn failure modes will add delays and many retries to work around esp and ap bugs, ie, anti de-auth protections
                                                    // https://github.com/tzapu/WiFiManager/issues/1067
     bool          _allowExit              = true; // allow exit in nonblocking, else user exit/abort calls will be ignored including cptimeout
+
+    bool          _testAuth               = false;
+    String        _username               = "";
+    String        _password               = "";
 
     #ifdef ESP32
     wifi_event_id_t wm_event_id           = 0;
@@ -663,8 +676,32 @@ protected:
 
     // webserver handlers
 public:
+    #if WM_USE_ASYNC_WEBSERVER == 1
+    void          handleNotFound(AsyncWebServerRequest *request);
+    #else
     void          handleNotFound();
+    #endif
 protected:
+    #if WM_USE_ASYNC_WEBSERVER == 1
+    void          HTTPSend(AsyncWebServerRequest *request, const String &content, std::vector<std::pair<String, String>> headers = {});
+    void          handleRoot(AsyncWebServerRequest *request);
+    void          handleWifi(AsyncWebServerRequest *request, boolean scan);
+    void          handleWifiSave(AsyncWebServerRequest *request);
+    void          handleInfo(AsyncWebServerRequest *request);
+    void          handleReset(AsyncWebServerRequest *request);
+
+    void          handleExit(AsyncWebServerRequest *request);
+    void          handleClose(AsyncWebServerRequest *request);
+    // void          handleErase();
+    void          handleErase(AsyncWebServerRequest *request, boolean opt);
+    void          handleParam(AsyncWebServerRequest *request);
+    void          handleWiFiStatus(AsyncWebServerRequest *request);
+    void          handleRequest(AsyncWebServerRequest *request);
+    void          handleParamSave(AsyncWebServerRequest *request);
+    void          doParamSave(AsyncWebServerRequest *request);
+
+    boolean       captivePortal(AsyncWebServerRequest *request);
+    #else
     void          HTTPSend(const String &content);
     void          handleRoot();
     void          handleWifi(boolean scan);
@@ -683,13 +720,20 @@ protected:
     void          doParamSave();
 
     boolean       captivePortal();
+    #endif
     boolean       configPortalHasTimeout();
     uint8_t       processConfigPortal();
     void          stopCaptivePortal();
 	// OTA Update handler
+    #if WM_USE_ASYNC_WEBSERVER == 1
+	void          handleUpdate(AsyncWebServerRequest *request);
+	void          handleUpdating(AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final);
+	void          handleUpdateDone(AsyncWebServerRequest *request);
+    #else
 	void          handleUpdate();
 	void          handleUpdating();
 	void          handleUpdateDone();
+    #endif
 
 
     // wifi platform abstractions
